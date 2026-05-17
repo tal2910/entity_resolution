@@ -1,51 +1,105 @@
+# ============================================================================
+# Record matcher configuration. Every parameter is annotated with the
+# function(s) that consume it, formatted as `file::function`.
+#
+# Loaded ONCE at startup by `match_records.py :: Config.from_yaml(...)`.
+# The Config dataclass is immutable and passed to every stage helper.
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# paths
+#   Input CSVs + output destinations. Set any output path to `null` to skip
+#   writing that file.
+#   Consumed by:
+#     match_records.py :: run()                  -- pd.read_csv on inputs
+#     match_records.py :: _write_outputs()       -- matches + matches_debug
+#     match_records.py :: _write_rejection_logs()-- rejected_dataset_*
+#     match_records.py :: _write_unmatched()     -- unmatched_dataset_*
+#     ingestion.py     :: write()                -- physical CSV write
+# ----------------------------------------------------------------------------
 paths:
-  dataset_1: /mnt/user-data/uploads/dataset_1__32_.csv
-  dataset_2: /mnt/user-data/uploads/dataset_2__32_.csv
-  matches: /mnt/user-data/outputs/matches.csv
-  matches_debug: /mnt/user-data/outputs/matches_debug.csv
-  rejected_dataset_1: /mnt/user-data/outputs/rejected_dataset_1.csv
-  rejected_dataset_2: /mnt/user-data/outputs/rejected_dataset_2.csv
-  unmatched_dataset_1: /mnt/user-data/outputs/unmatched_dataset_1.csv
-  unmatched_dataset_2: /mnt/user-data/outputs/unmatched_dataset_2.csv
+  # Input files. Format is the caller's choice; the orchestrator uses
+  # pd.read_csv() today, swap to pd.read_parquet() or another reader if
+  # the source format changes.
+  dataset_1: input/dataset_1.csv
+  dataset_2: input/dataset_2.csv
+
+  # Output files.
+  matches:       outputs/matches.csv
+  matches_debug: outputs/matches_debug.csv   # set to null to skip
+
+  # Per-dataset rejection logs. Set to null to skip per side.
+  rejected_dataset_1: outputs/rejected_dataset_1.csv
+  rejected_dataset_2: outputs/rejected_dataset_2.csv
+
+  # Per-dataset "unmatched" logs: rows that passed ingestion but ended
+  # up in zero matched pairs (no partner above threshold, or lost the
+  # contest in 1:1 mode). Set to null to skip per side.
+  unmatched_dataset_1: outputs/unmatched_dataset_1.csv
+  unmatched_dataset_2: outputs/unmatched_dataset_2.csv
+
+
+# ----------------------------------------------------------------------------
+# logging
+#   Consumed by: match_records.py :: setup_logging()
+#   DEBUG includes per-block, per-pair detail. INFO is the default summary.
+# ----------------------------------------------------------------------------
 logging:
-  level: INFO
+  level: INFO    # DEBUG | INFO | WARNING
+
+
+# ----------------------------------------------------------------------------
+# scoring
+#   The strategy switch picks one of the two sub-blocks below.
+#   Consumed by:
+#     match_records.py :: Config.weights / .similarity / .field_mappings
+#                         (properties that resolve `<strategy>` -> sub-block)
+#     match_records.py :: score_and_assign()      -- runs scoring per chunk
+#     match_records.py :: score_field()           -- one field at a time
+#     match_records.py :: combine_scores()        -- NaN-aware weighted avg
+#     assignment.py    :: assign()                -- match_threshold filter
+# ----------------------------------------------------------------------------
 scoring:
-  strategy: per_field
-  match_threshold: 75.0
+  strategy: per_field    # per_field | concatenated   (selects sub-block below)
+  match_threshold: 75    # 0..100. Pairs below this are NOT matches.
+                         # Used in assignment.py :: assign() to filter results.
+
+  # --- Strategy: per_field ----------------------------------------------------
+  # Score name/street/city/zip independently, then weighted-average.
+  # Per-field scores appear in matches_debug.csv (diagnostics).
   per_field:
-    weights:
-      name: 0.4
-      street: 0.4
+    weights:                   # Used in match_records.py :: combine_scores()
+      name: 0.4                #   Sum to 1.0 (validated at config-load)
+      street: 0.4              #   Missing fields -> redistributed via NaN-aware avg
       city: 0.1
       zip: 0.1
-    similarity:
-      name: token_set_ratio
-      street: token_sort_ratio
+    similarity:                # Used in match_records.py :: score_field()
+      name: token_set_ratio    #   one similarity_fn per field, looked up in
+      street: token_sort_ratio #   match_records.py :: SIMILARITY_FUNCTIONS registry
       city: token_sort_ratio
       zip: exact_match
-    field_mappings:
+    field_mappings:            # Used in match_records.py :: score_field()
+      # For each field, list which NORMALIZED columns on each side participate.
+      # score_field takes MAX over the cross-product of (left_cols x right_cols).
+      # Example: name has 1 column in combined, 3 in split -> 3 similarity
+      #          calls per pair, MAX wins.
       name:
-        combined:
-        - name_norm
-        split:
-        - name1_norm
-        - name2_norm
-        - name3_norm
+        combined: [name_norm]
+        split:    [name1_norm, name2_norm, name3_norm]
       street:
-        combined:
-        - street_norm
-        split:
-        - street_norm
+        combined: [street_norm]
+        split:    [street_norm]
       city:
-        combined:
-        - city_norm
-        split:
-        - city_norm
+        combined: [city_norm]
+        split:    [city_norm]
       zip:
-        combined:
-        - zip5
-        split:
-        - zip5
+        combined: [zip5]
+        split:    [zip5]
+
+  # --- Strategy: concatenated -----------------------------------------------
+  # Score full address string vs full address string. Use when address parsing
+  # might fail (free-form / international addresses).
   concatenated:
     weights:
       name: 0.45
@@ -57,35 +111,78 @@ scoring:
       zip: exact_match
     field_mappings:
       name:
-        combined:
-        - name_norm
-        split:
-        - name1_norm
-        - name2_norm
-        - name3_norm
+        combined: [name_norm]
+        split:    [name1_norm, name2_norm, name3_norm]
       address:
-        combined:
-        - address_norm
-        split:
-        - address_norm
+        combined: [address_norm]
+        split:    [address_norm]    # built by schema (multi-source join)
       zip:
-        combined:
-        - zip5
-        split:
-        - zip5
+        combined: [zip5]
+        split:    [zip5]
+
+
+# ----------------------------------------------------------------------------
+# assignment
+#   How candidate pairs become final pairs.
+#   Consumed by:
+#     match_records.py :: score_and_assign()              -- dispatches by name
+#     assignment.py    :: assign()                        -- runs the chosen method
+#     assignment.py    :: apply_global_cardinality()      -- enforces method's
+#                                                            cardinality across blocks
+#     match_records.py :: _apply_min_id_anchor()          -- optional collapse
+# ----------------------------------------------------------------------------
 assignment:
+  # 1:1     hungarian | greedy_mutual | mutual_best
+  # 1:many  one_per_row     (rows up to 1 partner, cols any)
+  # many:1  one_per_col     (rows any, cols up to 1 partner)
+  # many:many  threshold_only  (no cardinality constraint)
   method: greedy_mutual
+
+  # Optional post-processing. Used in match_records.py :: _apply_min_id_anchor().
+  # combined | split | null
+  #   - When set, each non-parent record keeps ONLY the pair whose partner
+  #     on the parent side has the smallest id. Useful with threshold_only
+  #     to collapse ambiguity deterministically (smallest id wins, not score).
+  #   - No-op for 1:1 methods (no ambiguity to break).
   anchor_by_min_id_on: null
+
+
+# ----------------------------------------------------------------------------
+# blocking
+#   Partition both DataFrames by shared values of a key and score only
+#   within partitions. Auto-enables when datasets exceed the row threshold.
+#   Consumed by:
+#     match_records.py :: _match()              -- chooses blocked vs full path
+#     match_records.py :: _run_blocked()        -- the per-chunk loop
+#     blocking.py      :: iter_chunks()         -- yields (value, l_chunk, r_chunk)
+# ----------------------------------------------------------------------------
 blocking:
-  enable_above_rows: 1000
+  enable_above_rows: 1000   # _match() checks: max(len(split), len(combined)) > N
+                            #   0           = always block (force on)
+                            #   very large  = never block (force off)
   keys:
-  # Composite: city + first-3-digits of zip. Tighter than blocking on
-  # either alone, but loose enough to absorb zip-code data-entry errors
-  # within a small region (e.g. 93401 vs 93405 both => zip3=934).
-  - city_zip3
+    # Each key is a normalized COLUMN NAME produced by the schema below.
+    # Multi-key = OR-style union (a pair sharing ANY key qualifies).
+    # The aggregation loop deduplicates pairs scored under multiple keys.
+    - city_zip3   # composite: city + zip3 (defined in schema.composites)
+
+
+# ----------------------------------------------------------------------------
+# ingestion
+#   Validation rules applied BEFORE normalization. Failed rows go to
+#   rejected_dataset_*.csv with a reason column.
+#   Consumed by:
+#     match_records.py :: _ingest()                         -- per side
+#     ingestion.py     :: apply_checks()                    -- dispatcher
+#     ingestion.py     :: check_required_fields_iterative   (mode: iterative)
+#     ingestion.py     :: check_unique_fields_iterative
+#     ingestion.py     :: check_required_fields_vectorized  (mode: vectorized)
+#     ingestion.py     :: check_unique_fields_vectorized
+# ----------------------------------------------------------------------------
 ingestion:
-  mode: iterative
-  required_fields:
+  mode: iterative   # iterative (readable, default) | vectorized (~2x faster)
+
+  required_fields:  # rows with these columns blank are rejected
     combined:
     - id
     - name
@@ -95,13 +192,86 @@ ingestion:
     - street
     - city
     - zip
-  unique_fields:
-    combined:
+
+  unique_fields:    # duplicates on these columns -> rejected (first wins,
+    combined:       # siblings get _kept_id pointing to the survivor)
     - id
     split:
     - id
+
+
+# ----------------------------------------------------------------------------
+# schema
+#   Drives the prep stage. Adding a new CSV column is one line here, no code.
+#
+#   Consumed by:
+#     match_records.py :: prep_dataset()                  -- orchestrator
+#     match_records.py :: _maybe_parse_combined_address() -- uses parse_combined_address_from
+#     match_records.py :: _normalize_per_schema()         -- uses columns
+#     match_records.py :: _apply_composites()             -- uses composites
+#     match_records.py :: parse_combined_address()        -- regex parser for combined-address dataset
+#     match_records.py :: Normalizer.name / .text / .zip5 -- the `fn` registry
+#
+#   Per side ('combined' and 'split'):
+#     parse_combined_address_from:  OPTIONAL. Parse a free-form address column
+#                                   into _street_raw / _city_raw / _state_raw /
+#                                   _zip_raw. Those become available as sources.
+#     columns:                      output_col -> {source, fn, sep?}
+#       source: str               | a single raw column to normalize
+#               list[str]         | several columns joined with `sep`, then normalized
+#       fn:     name | text | zip5  (Normalizer methods)
+#       sep:    join separator when source is a list (default " ")
+#       NOTE: columns process in DECLARED order. A later `source` may reference
+#             an earlier OUTPUT column (e.g. address_norm joining normalized zip5).
+#
+#   composites: applied AFTER per-side columns. SAME spec applied to BOTH sides.
+#     parts: list, each entry is:
+#       "string literal"          | a literal
+#       {col: NAME}                | reference to a prior column
+#       {col: NAME, prefix: N}     | first N chars of the column
+#       {col: NAME, suffix: N}     | last N chars of the column
+# ----------------------------------------------------------------------------
+schema:
+  combined:
+    parse_combined_address_from: address    # parses df['address'] -> _street_raw etc
+    columns:
+      name_norm:    {source: name,        fn: name}    # Normalizer.name
+      street_norm:  {source: _street_raw, fn: text}    # Normalizer.text
+      city_norm:    {source: _city_raw,   fn: text}
+      zip5:         {source: _zip_raw,    fn: zip5}    # Normalizer.zip5
+      address_norm: {source: address,     fn: text}
+
+  split:
+    columns:
+      name1_norm:   {source: account_name, fn: name}
+      name2_norm:   {source: owner_name,   fn: name}
+      name3_norm:   {source: name,         fn: name}
+      street_norm:  {source: street,       fn: text}
+      city_norm:    {source: city,         fn: text}
+      zip5:         {source: zip,          fn: zip5}
+      # Multi-source: join then normalize. `zip5` here is the ALREADY-NORMALIZED
+      # column above (declaration order matters).
+      address_norm: {source: [street, city, zip5], fn: text, sep: ", "}
+
+  composites:    # Used by both prep_dataset() calls (combined and split)
+    city_zip3:                          # the default blocking key, referenced
+      parts:                            #   by blocking.keys above
+        - {col: city_norm}
+        - "|"
+        - {col: zip5, prefix: 3}
+
+
+# ----------------------------------------------------------------------------
+# normalization
+#   Lookup tables for the Normalizer text-cleaning rules.
+#   Consumed by:
+#     match_records.py :: Normalizer.__init__       -- loads both tables
+#     match_records.py :: Normalizer.name()         -- strips business_suffixes
+#     match_records.py :: Normalizer.text()         -- expands street_abbreviations
+# ----------------------------------------------------------------------------
 normalization:
-  business_suffixes:
+  business_suffixes:    # tokens removed from business names BEFORE comparison
+                        # (so "Acme Corp" and "Acme Inc" both normalize to "ACME")
   - INC
   - LLC
   - LLP
@@ -113,7 +283,9 @@ normalization:
   - COMPANY
   - PLC
   - GMBH
-  street_abbreviations:
+
+  street_abbreviations: # token-level replacements applied during text normalization
+                        # (so "123 Main St" and "123 Main Street" both normalize the same)
     ST: STREET
     STR: STREET
     AVE: AVENUE
