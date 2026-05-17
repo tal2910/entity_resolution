@@ -1,0 +1,13 @@
+# Record matcher — runtime dependencies
+#
+# Python:   3.10 or newer required (uses `X | None` union syntax in type hints).
+# Install:  pip install -r requirements.txt
+#
+# Minimums are set to versions known to expose the APIs we call. The
+# "tested" comment is the version this project was last verified against.
+
+pandas>=2.0       # tested 3.0.2   -- DataFrames, ingestion, normalization, output CSVs
+numpy>=1.24       # tested 2.4.4   -- score matrices, NaN-aware weighted combination
+pyyaml>=6.0       # tested 6.0.3   -- config.yml parsing
+rapidfuzz>=3.0    # tested 3.14.5  -- token_set_ratio, token_sort_ratio, edit-distance ratio
+scipy>=1.10       # tested 1.17.1  -- linear_sum_assignment (Hungarian algorithm)

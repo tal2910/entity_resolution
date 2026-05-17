@@ -1,0 +1,146 @@
+paths:
+  dataset_1: /mnt/user-data/uploads/dataset_1__32_.csv
+  dataset_2: /mnt/user-data/uploads/dataset_2__32_.csv
+  matches: /mnt/user-data/outputs/matches.csv
+  matches_debug: /mnt/user-data/outputs/matches_debug.csv
+  rejected_dataset_1: /mnt/user-data/outputs/rejected_dataset_1.csv
+  rejected_dataset_2: /mnt/user-data/outputs/rejected_dataset_2.csv
+  unmatched_dataset_1: /mnt/user-data/outputs/unmatched_dataset_1.csv
+  unmatched_dataset_2: /mnt/user-data/outputs/unmatched_dataset_2.csv
+logging:
+  level: INFO
+scoring:
+  strategy: per_field
+  match_threshold: 75.0
+  per_field:
+    weights:
+      name: 0.4
+      street: 0.4
+      city: 0.1
+      zip: 0.1
+    similarity:
+      name: token_set_ratio
+      street: token_sort_ratio
+      city: token_sort_ratio
+      zip: exact_match
+    field_mappings:
+      name:
+        combined:
+        - name_norm
+        split:
+        - name1_norm
+        - name2_norm
+        - name3_norm
+      street:
+        combined:
+        - street_norm
+        split:
+        - street_norm
+      city:
+        combined:
+        - city_norm
+        split:
+        - city_norm
+      zip:
+        combined:
+        - zip5
+        split:
+        - zip5
+  concatenated:
+    weights:
+      name: 0.45
+      address: 0.45
+      zip: 0.1
+    similarity:
+      name: token_set_ratio
+      address: token_sort_ratio
+      zip: exact_match
+    field_mappings:
+      name:
+        combined:
+        - name_norm
+        split:
+        - name1_norm
+        - name2_norm
+        - name3_norm
+      address:
+        combined:
+        - address_norm
+        split:
+        - address_norm
+      zip:
+        combined:
+        - zip5
+        split:
+        - zip5
+assignment:
+  method: greedy_mutual
+  anchor_by_min_id_on: null
+blocking:
+  enable_above_rows: 1000
+  keys:
+  # Composite: city + first-3-digits of zip. Tighter than blocking on
+  # either alone, but loose enough to absorb zip-code data-entry errors
+  # within a small region (e.g. 93401 vs 93405 both => zip3=934).
+  - city_zip3
+ingestion:
+  mode: iterative
+  required_fields:
+    combined:
+    - id
+    - name
+    - address
+    split:
+    - id
+    - street
+    - city
+    - zip
+  unique_fields:
+    combined:
+    - id
+    split:
+    - id
+normalization:
+  business_suffixes:
+  - INC
+  - LLC
+  - LLP
+  - LP
+  - LTD
+  - CORP
+  - CORPORATION
+  - CO
+  - COMPANY
+  - PLC
+  - GMBH
+  street_abbreviations:
+    ST: STREET
+    STR: STREET
+    AVE: AVENUE
+    AV: AVENUE
+    BLVD: BOULEVARD
+    BLV: BOULEVARD
+    RD: ROAD
+    DR: DRIVE
+    LN: LANE
+    CT: COURT
+    PL: PLACE
+    PKWY: PARKWAY
+    HWY: HIGHWAY
+    FWY: FREEWAY
+    TER: TERRACE
+    TRL: TRAIL
+    CIR: CIRCLE
+    SQ: SQUARE
+    STE: SUITE
+    APT: APARTMENT
+    BLDG: BUILDING
+    FL: FLOOR
+    N: NORTH
+    S: SOUTH
+    E: EAST
+    W: WEST
+    NE: NORTHEAST
+    NW: NORTHWEST
+    SE: SOUTHEAST
+    SW: SOUTHWEST
