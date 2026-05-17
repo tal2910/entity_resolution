@@ -135,6 +135,11 @@ class Config:
     business_suffixes: frozenset
     street_abbreviations: dict
 
+    # Schema (drives prep_dataset)
+    schema_combined: dict     # {parse_combined_address_from?, columns: {...}}
+    schema_split: dict
+    composites: dict          # {name: {parts: [...]}}
+
     @property
     def weights(self) -> dict:
         return self.weights_by_strategy[self.strategy]
@@ -275,7 +280,28 @@ class Config:
             ingestion_mode=ingestion_mode,
             business_suffixes=frozenset(n["business_suffixes"]),
             street_abbreviations=dict(n["street_abbreviations"]),
+            schema_combined=_validate_schema(raw["schema"]["combined"], "combined"),
+            schema_split=_validate_schema(raw["schema"]["split"], "split"),
+            composites=raw["schema"].get("composites", {}) or {},
         )
+
+
+def _validate_schema(schema: dict, side: str) -> dict:
+    """Sanity-check a schema entry early so errors are clear, not cryptic."""
+    if "columns" not in schema:
+        raise ValueError(f"schema.{side}: missing required 'columns' key")
+    valid_fns = {"name", "text", "zip5"}
+    for output_col, spec in schema["columns"].items():
+        if "source" not in spec or "fn" not in spec:
+            raise ValueError(
+                f"schema.{side}.columns.{output_col}: each entry needs 'source' and 'fn'"
+            )
+        if spec["fn"] not in valid_fns:
+            raise ValueError(
+                f"schema.{side}.columns.{output_col}.fn={spec['fn']!r} invalid. "
+                f"Available: {sorted(valid_fns)}"
+            )
+    return schema
 
 
 def _optional_path(value) -> Path | None:
@@ -354,46 +380,100 @@ def parse_combined_address(s: str) -> tuple[str, str, str, str]:
 # Loading. Both prep functions produce all columns either strategy needs.
 # ===========================================================================
 
-def prep_combined(df: pd.DataFrame, norm: Normalizer) -> pd.DataFrame:
-    """dataset_1 style: id, address, name."""
-    parsed = df["address"].map(parse_combined_address)
-    streets, cities, _states, zips = zip(*parsed) if len(parsed) else ([], [], [], [])
+def prep_dataset(df: pd.DataFrame, norm: "Normalizer", schema: dict, composites: dict) -> pd.DataFrame:
+    """
+    Generic per-side preparation. Replaces the old hardcoded
+    `prep_combined` / `prep_split`. Schema-driven: adding a new CSV
+    column means adding one line in `schema.<side>.columns`, no code
+    change.
 
-    out = pd.DataFrame({"id": df["id"].astype(str)})
-    out["name_norm"]    = df["name"].map(norm.name)
-    out["street_norm"]  = pd.Series(streets, index=df.index).map(norm.text)
-    out["city_norm"]    = pd.Series(cities,  index=df.index).map(norm.text)
-    out["zip5"]         = pd.Series(zips,    index=df.index)
-    out["address_norm"] = df["address"].map(norm.text)
-    # zip3 = first 3 digits of zip5 (the US "sectional center facility").
-    # Nearby zip5 values often share zip3, so this loosens blocking just
-    # enough to absorb zip-code data-entry errors within a small region.
-    out["zip3"] = out["zip5"].str[:3]
-    # Composite blocking keys: share city AND zip (or zip3).
-    out["city_zip"]  = out["city_norm"] + "|" + out["zip5"]
-    out["city_zip3"] = out["city_norm"] + "|" + out["zip3"]
+    Steps:
+      1. (optional) Parse a free-form combined-address column into raw parts
+      2. Apply per-column normalizers per `schema.columns`
+      3. Build composite columns per `composites`
+    """
+    df = _maybe_parse_combined_address(df, schema)
+    out = _normalize_per_schema(df, schema, norm)
+    _apply_composites(out, composites)
     return out
 
 
-def prep_split(df: pd.DataFrame, norm: Normalizer) -> pd.DataFrame:
-    """dataset_2 style: id, account_name, owner_name, name, street, city, zip."""
+def _maybe_parse_combined_address(df: pd.DataFrame, schema: dict) -> pd.DataFrame:
+    """If schema declares a combined-address column, parse it into raw
+    parts. The raw parts (_street_raw / _city_raw / _state_raw / _zip_raw)
+    become available as sources for the normalization step."""
+    addr_col = schema.get("parse_combined_address_from")
+    if not addr_col:
+        return df
+    parsed = df[addr_col].map(parse_combined_address)
+    streets, cities, states, zips = zip(*parsed) if len(parsed) else ([], [], [], [])
+    df = df.copy()
+    df["_street_raw"] = pd.Series(streets, index=df.index)
+    df["_city_raw"]   = pd.Series(cities,  index=df.index)
+    df["_state_raw"] = pd.Series(states,  index=df.index)
+    df["_zip_raw"]    = pd.Series(zips,    index=df.index)
+    return df
+
+
+def _normalize_per_schema(df: pd.DataFrame, schema: dict, norm: "Normalizer") -> pd.DataFrame:
+    """Apply schema.columns rules in declared order. A source can be:
+      - a raw column in `df`
+      - a previously-computed column in `out` (must appear earlier in
+        schema.columns)
+    """
     out = pd.DataFrame({"id": df["id"].astype(str)})
-    out["name1_norm"]  = df["account_name"].map(norm.name)
-    out["name2_norm"]  = df["owner_name"].map(norm.name)
-    out["name3_norm"]  = df["name"].map(norm.name)
-    out["street_norm"] = df["street"].map(norm.text)
-    out["city_norm"]   = df["city"].map(norm.text)
-    out["zip5"]        = df["zip"].map(norm.zip5)
-    combined = (
-        df["street"].fillna("").astype(str) + ", "
-        + df["city"].fillna("").astype(str) + " "
-        + out["zip5"]
-    )
-    out["address_norm"] = combined.map(norm.text)
-    out["zip3"] = out["zip5"].str[:3]
-    out["city_zip"]  = out["city_norm"] + "|" + out["zip5"]
-    out["city_zip3"] = out["city_norm"] + "|" + out["zip3"]
+
+    def _resolve(col_name: str) -> pd.Series:
+        if col_name in out.columns:
+            return out[col_name]
+        if col_name in df.columns:
+            return df[col_name]
+        raise ValueError(
+            f"schema source {col_name!r} not found. Available raw: {list(df.columns)}, "
+            f"available previously-computed: {list(out.columns)}"
+        )
+
+    for output_col, spec in schema["columns"].items():
+        source = spec["source"]
+        fn = getattr(norm, spec["fn"])         # norm.name, norm.text, norm.zip5
+
+        if isinstance(source, list):
+            sep = spec.get("sep", " ")
+            parts = [_resolve(c).fillna("").astype(str) for c in source]
+            joined = parts[0]
+            for p in parts[1:]:
+                joined = joined + sep + p
+            out[output_col] = joined.map(fn)
+        else:
+            out[output_col] = _resolve(source).map(fn)
+
     return out
+
+
+def _apply_composites(out: pd.DataFrame, composites: dict) -> None:
+    """Build composite columns from declarative specs. Each composite
+    is a list of parts; parts can be literals or column references with
+    optional prefix/suffix slicing."""
+    for name, spec in composites.items():
+        parts = spec.get("parts", [])
+        result = pd.Series([""] * len(out), index=out.index, dtype=object)
+        for inp in parts:
+            if isinstance(inp, str):
+                # Literal
+                result = result + inp
+            elif isinstance(inp, dict) and "col" in inp:
+                col = out[inp["col"]].astype(str)
+                if "prefix" in inp:
+                    col = col.str[:int(inp["prefix"])]
+                elif "suffix" in inp:
+                    col = col.str[-int(inp["suffix"]):]
+                result = result + col
+            else:
+                raise ValueError(
+                    f"composites.{name}.parts contains unrecognized entry: {inp!r}. "
+                    f"Use a string literal or a dict with 'col' (and optional prefix/suffix)."
+                )
+        out[name] = result
 
 
 # ===========================================================================
@@ -596,7 +676,7 @@ def run(config: Config):
     _write_rejection_logs(ingest_combined, ingest_split, config)
 
     # Stage 4: Normalize.
-    split, combined = _normalize(ingest_combined, ingest_split, norm)
+    split, combined = _normalize(ingest_combined, ingest_split, norm, config)
 
     # Stage 5: Score + assign matches.
     result = _match(split, combined, config)
@@ -663,14 +743,14 @@ def _normalize(
     ingest_combined: ingestion.IngestResult,
     ingest_split: ingestion.IngestResult,
     norm: Normalizer,
+    config: Config,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Stage 4: normalize names/addresses and parse dataset_1's combined
-    address into fields. Returns (split, combined) in the order used
-    downstream by `_match`."""
+    """Stage 4: schema-driven normalization. Returns (split, combined)
+    in the order used downstream by `_match`."""
     logger.info("Normalizing %d + %d records",
                 len(ingest_combined.kept), len(ingest_split.kept))
-    combined = prep_combined(ingest_combined.kept, norm)
-    split = prep_split(ingest_split.kept, norm)
+    combined = prep_dataset(ingest_combined.kept, norm, config.schema_combined, config.composites)
+    split    = prep_dataset(ingest_split.kept,    norm, config.schema_split,    config.composites)
     return split, combined
 
 
