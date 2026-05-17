@@ -118,28 +118,183 @@ Multi-key blocking iterates each key separately; a pair scored under multiple ke
 
 ## Scoring
 
-Two strategies, switchable via `scoring.strategy`:
+### The formula in one line
 
-**`per_field`** (default) — score name, street, city, zip independently, then weighted average. Per-field diagnostics in `matches_debug.csv`. Default weights: `name 0.40, street 0.40, city 0.10, zip 0.10`.
+For each candidate pair `(i, j)`:
 
-**`concatenated`** — score full address strings end-to-end. Default weights: `name 0.45, address 0.45, zip 0.10`. More robust when address parsing might fail or for free-form addresses.
+```
+combined_score(i, j) = Σ weight[f] · field_score[f](i, j)   for all fields f where field_score is not NaN
+                       ─────────────────────────────────
+                           Σ weight[f]   for those same f
+```
 
-NaN-aware weighted average: missing fields don't penalize, weight redistributes across present fields.
+NaN-aware weighted average. Missing fields don't penalize — the weight redistributes across the fields that ARE present.
+
+A pair becomes a candidate match iff `combined_score ≥ match_threshold`.
+
+### Per-field score: MAX across the cross-product
+
+```
+field_score[f](i, j) = MAX over (lc, rc) of similarity_fn[f](left[lc][i], right[rc][j])
+```
+
+where `(lc, rc)` ranges over all column pairs declared in `field_mappings[f]`. For most fields the cross-product is 1×1 (one column each side). For `name` in this dataset, it's 1×3 — dataset_2 has three name slots (`account_name`, `owner_name`, `name`), dataset_1 has one (`name`), MAX takes the best.
+
+### Strategy 1: `per_field` (default)
+
+```yaml
+weights:
+  name:   0.40
+  street: 0.40
+  city:   0.10
+  zip:    0.10
+similarity:
+  name:   token_set_ratio    # tolerant of extra tokens (LLC, Italian Restaurant)
+  street: token_sort_ratio   # every token counts, order doesn't
+  city:   token_sort_ratio
+  zip:    exact_match        # binary: 100 if equal, 0 otherwise
+```
+
+Scores 4 fields independently. Per-field breakdown is written to `matches_debug.csv` — auditable.
+
+### Strategy 2: `concatenated`
+
+```yaml
+weights:
+  name:    0.45
+  address: 0.45
+  zip:     0.10
+similarity:
+  name:    token_set_ratio
+  address: token_sort_ratio
+  zip:     exact_match
+```
+
+Compares the full address as one string against the full address as one string. For dataset_1 the `address_norm` is the raw `address` field normalized; for dataset_2 it's `street + ", " + city + " " + zip5` then normalized. Use when address parsing might fail or for free-form / international addresses.
 
 ### Similarity functions (rapidfuzz-backed)
 
-| Function | When to use |
-|---|---|
-| `token_set_ratio` | Default for names — tolerates extra tokens (`"LLC"`, `"Italian Restaurant"`) |
-| `token_sort_ratio` | Default for addresses — every token counts, order doesn't |
-| `ratio` | Plain edit-distance ratio |
-| `partial_ratio` | Substring matching |
-| `jaccard` / `jaccard_ngram` | Set-based similarity |
-| `exact_match` | Binary 100/0 — used for zip5 |
+| Function | What it does | Best for |
+|---|---|---|
+| `token_set_ratio` | Compares the sets of tokens; tolerates **extra** tokens on either side | Names that may include extra words ('LLC', 'Italian Restaurant') |
+| `token_sort_ratio` | Sorts tokens alphabetically then compares; every token matters | Addresses (order doesn't, but completeness does) |
+| `ratio` | Plain Levenshtein-based edit-distance ratio | Strict comparison; punishes any difference |
+| `partial_ratio` | Best-substring match of shorter into longer | One value may be a fragment of the other |
+| `jaccard` | Set-based overlap of words | Short multi-word fields |
+| `jaccard_ngram` | Set-based overlap of n-grams | Misspelling-tolerant fuzzy comparison |
+| `exact_match` | 100 if equal, else 0 (binary) | Codes (zip, SSN, EIN) where any diff = different entity |
 
-### `field_mappings`
+Picking the right similarity function matters more than picking the right weights. `token_set_ratio` is the right default for names because it absorbs LLC/Inc/extra-tokens noise. `token_sort_ratio` is the right default for addresses because '4 Apt' and 'Apt 4' should match, but missing tokens should hurt.
 
-Per-strategy declaration of which normalized column(s) feed which scoring field. dataset_2's three name columns are MAX-pooled against dataset_1's one — whichever of the three best matches dataset_1's name wins.
+### Worked example A — clean match (MLK Gas Station)
+
+```
+dataset_2 row 0: name1='MLK GAS STATION', name2='TTVV',          name3='MLK GAS STATION',
+                 street='1515 W MLK JR BLVD', city='LOS ANGELES', zip5='90062'
+dataset_1 row 3: name='MLK Gas Station', address='1515 W Martin Luther King Jr Blvd, Los Angeles, CA 90062'
+                 -> normalized: name='MLK GAS STATION', street='1515 W MARTIN LUTHER KING JR BOULEVARD',
+                                city='LOS ANGELES', zip5='90062'
+
+Per-field similarities:
+  name:   MAX(sim('MLK GAS STATION', 'MLK GAS STATION'),     -> 100
+             sim('TTVV',            'MLK GAS STATION'),     ->  21
+             sim('MLK GAS STATION', 'MLK GAS STATION'))     -> 100
+       =  100
+  street: token_sort('1515 W MLK JR BLVD', '1515 W MARTIN LUTHER KING JR BOULEVARD') = ~100
+  city:   token_sort('LOS ANGELES', 'LOS ANGELES')                                    = 100
+  zip:    exact_match('90062', '90062')                                                = 100
+
+Weighted average:  0.40·100 + 0.40·100 + 0.10·100 + 0.10·100  =  100.0
+                   ─────────────────────────────────────────
+                                   1.00
+
+100 ≥ 75 → MATCH
+```
+
+### Worked example B — partial match with NaN renormalization (Olive Garden)
+
+```
+dataset_2 row k: name1='OLIVE GARDEN', name2='N AND D RESTAURANTS LLC', name3='OLIVE GARDEN',
+                 street='11966 LOS OSOS VALLEY RD', city='SAN LUIS OBISPO', zip5='93405'
+dataset_1 row m: name='Olive Garden Italian Restaurant',
+                 address='11966 Los Osos Valley Rd, San Luis Obispo, CA 93401'
+                 -> normalized: name='OLIVE GARDEN ITALIAN RESTAURANT',
+                                street='11966 LOS OSOS VALLEY ROAD', city='SAN LUIS OBISPO', zip5='93401'
+
+Per-field similarities:
+  name:   MAX(sim('OLIVE GARDEN',                'OLIVE GARDEN ITALIAN RESTAURANT'),  -> 100  (token_set treats 'OLIVE GARDEN' as a subset)
+             sim('N AND D RESTAURANTS LLC',      'OLIVE GARDEN ITALIAN RESTAURANT'),  ->  37
+             sim('OLIVE GARDEN',                 'OLIVE GARDEN ITALIAN RESTAURANT'))  -> 100
+       =  100
+  street: token_sort('11966 LOS OSOS VALLEY RD', '11966 LOS OSOS VALLEY ROAD')       = 100  (RD normalizes to ROAD)
+  city:   100
+  zip:    exact_match('93405', '93401')                                              =   0
+
+Weighted average:  0.40·100 + 0.40·100 + 0.10·100 + 0.10·0   =   90.0
+                   ────────────────────────────────────────
+                                  1.00
+
+90 ≥ 75 → MATCH  (the zip mismatch costs 10 points but doesn't kill it)
+```
+
+### Worked example C — what NaN renormalization actually does
+
+Suppose dataset_2 row has `zip5=''` (missing). Then:
+
+```
+Per-field similarities:
+  name:   100
+  street: 100
+  city:   100
+  zip:    NaN     <- can't compare missing values
+
+valid fields = {name, street, city}
+total_weight = 0.40 + 0.40 + 0.10 = 0.90    (zip weight 0.10 excluded)
+
+Weighted average:  0.40·100 + 0.40·100 + 0.10·100    =  100.0
+                   ─────────────────────────────────
+                              0.90
+
+100 ≥ 75 → MATCH  (missing zip did NOT penalize)
+```
+
+The alternative ("treat NaN as 0") would have given `90·0/1.0 = 90` — still a match here but punitive on partial data. With NaN renormalization, a row with no zip is judged purely on name/street/city.
+
+### Tuning playbook (the values you can play with)
+
+All knobs live in `config.yml` under `scoring.<strategy>`. Reload, rerun — no code change.
+
+| Symptom | Knob | Direction |
+|---|---|---|
+| Too many false positives (junk pairs labeled "match") | `match_threshold` | ↑ raise (e.g. 75 → 85) |
+| Missing real matches (low recall) | `match_threshold` | ↓ lower (e.g. 75 → 65) |
+| Same-address but unrelated businesses paired | `weights.name` | ↑ raise (e.g. 0.40 → 0.50) |
+| Same-name chains across cities paired | `weights.street` or `weights.city` | ↑ raise |
+| Zip-typos killing real matches | `weights.zip` | ↓ lower (e.g. 0.10 → 0.05), or swap `similarity.zip` to `jaccard_ngram` |
+| Street abbreviations causing false negatives | already handled by normalization (`ST→STREET` etc) — extend `normalization.street_abbreviations` |
+| Suffixes like 'Inc/LLC' creating noise | already handled by normalization (`business_suffixes`) |
+| Free-form addresses don't parse cleanly | switch `strategy: per_field` → `concatenated` |
+
+### Constraints
+
+- Weights must sum to 1.0 (validated at config-load time)
+- Similarity function names must be in the `SIMILARITY_FUNCTIONS` registry
+- Threshold is on the 0–100 scale (matches rapidfuzz convention)
+- Missing fields produce NaN — fully handled by the renormalization above; never an exception
+
+### Sensitivity check — what `match_threshold` does on the test data
+
+| Threshold | Matches found | Behavior |
+|---|---|---|
+| 90 | 37 / 39 | Drops the 2 borderline pairs (Olive Garden with zip mismatch scores 90, falls below at 90.0 cutoff strict-greater check; another similar partial) |
+| 80 | 39 / 39 | All real matches recovered |
+| 75 (default) | 39 / 39 | Catches all real matches |
+| 60 | 39 / 39 | Same; clean test data has no near-miss pairs in this range |
+| 40 | 39 / 39 | Same; with `greedy_mutual` the 1:1 lock prevents false positives even at low threshold |
+
+Test data is clean enough that thresholds 40–80 all produce the same matches (1:1 assignment locks each row to its single best partner, which is unambiguously correct). The threshold becomes load-bearing on **noisy data** or with **`threshold_only` assignment** — there it directly controls precision vs recall. Tune for your domain's cost asymmetry.
+
+
 
 ## Assignment Methods
 
